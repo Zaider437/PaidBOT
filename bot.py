@@ -76,6 +76,49 @@ def reset_user_state(user_id: int):
     _user_states.pop(user_id, None)
 
 
+_seen_file_hashes: set[str] = set()
+_seen_image_hashes: set[str] = set()
+_seen_file_unique_ids: set[str] = set()
+_seen_text_hashes: set[str] = set()
+_seen_check_numbers: set[str] = set()
+_max_cache_size = 5000
+
+
+def _add_to_seen_hashes(file_hash: str, image_hash: str, file_unique_id: str | None,
+                        text_hash: str | None, check_number: str | None):
+    """Track a verified screenshot in the in-memory cache."""
+    if len(_seen_file_hashes) >= _max_cache_size:
+        _seen_file_hashes.clear()
+        _seen_image_hashes.clear()
+        _seen_file_unique_ids.clear()
+        _seen_text_hashes.clear()
+        _seen_check_numbers.clear()
+    _seen_file_hashes.add(file_hash)
+    _seen_image_hashes.add(image_hash)
+    if file_unique_id:
+        _seen_file_unique_ids.add(file_unique_id)
+    if text_hash:
+        _seen_text_hashes.add(text_hash)
+    if check_number:
+        _seen_check_numbers.add(check_number)
+
+
+def _is_duplicate_in_memory(file_hash: str, image_hash: str, file_unique_id: str | None,
+                            text_hash: str | None = None, check_number: str | None = None) -> bool:
+    """Return True if this screenshot was already processed (in-memory check)."""
+    if file_hash in _seen_file_hashes:
+        return True
+    if image_hash in _seen_image_hashes:
+        return True
+    if file_unique_id and file_unique_id in _seen_file_unique_ids:
+        return True
+    if text_hash and text_hash in _seen_text_hashes:
+        return True
+    if check_number and check_number in _seen_check_numbers:
+        return True
+    return False
+
+
 def _get_supabase() -> Client | None:
     """Return the Supabase client (lazily initialized) or None."""
     global _supabase
@@ -110,7 +153,9 @@ def _init_db():
     if supabase is None:
         logger.warning(
             "SUPABASE_URL / SUPABASE_ANON_KEY not set — "
-            "duplicate detection is DISABLED. Duplicate payments will PASS!"
+            "Supabase duplicate detection is DISABLED. "
+            "Only in-memory duplicate detection is active "
+            "(resets on bot restart). Duplicate payments may PASS!"
         )
         return False
 
@@ -121,7 +166,9 @@ def _init_db():
     except Exception as e:
         logger.error(
             "Supabase table 'screenshots' not found or inaccessible. "
-            "Duplicate detection DISABLED.\n"
+            "Supabase duplicate detection DISABLED. "
+            "Only in-memory duplicate detection is active "
+            "(resets on bot restart).\n"
             "RUN THIS SQL in Supabase SQL Editor:\n%s", e, CREATE_TABLE_SQL
         )
         return False
@@ -461,6 +508,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_hash = _compute_file_hash(tmp_path)
     image_hash = _compute_image_hash(tmp_path)
 
+    # Check 0: in-memory cache (works even without Supabase)
+    if _is_duplicate_in_memory(file_hash, image_hash, photo.file_unique_id):
+        os.unlink(tmp_path)
+        logger.info("Duplicate detected via in-memory cache for user %s", user_id)
+        fail_msg = await update.message.reply_text(
+            DUPLICATE_SCREENSHOT_TEXT, reply_markup=PROOF_SENT_BUTTONS
+        )
+        state.bot_message_ids.append(fail_msg.message_id)
+        return
+
     # Check 1: file hash + perceptual hash (exact and visual duplicates)
     if _screenshot_exists(file_hash, image_hash):
         os.unlink(tmp_path)
@@ -514,8 +571,21 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state.bot_message_ids.append(fail_msg.message_id)
             return
 
+        # Check 5: in-memory text_hash / check_number (catches duplicates
+        # even when Supabase is unavailable)
+        if _is_duplicate_in_memory(file_hash, image_hash, photo.file_unique_id,
+                                    text_hash=text_hash, check_number=check_number):
+            logger.info("Duplicate detected via in-memory cache (text/check) for user %s", user_id)
+            fail_msg = await update.message.reply_text(
+                DUPLICATE_SCREENSHOT_TEXT, reply_markup=PROOF_SENT_BUTTONS
+            )
+            state.bot_message_ids.append(fail_msg.message_id)
+            return
+
         _store_screenshot(file_hash, image_hash, text_hash, check_number,
-                          user_id, photo.file_unique_id)
+                           user_id, photo.file_unique_id)
+        _add_to_seen_hashes(file_hash, image_hash, photo.file_unique_id,
+                              text_hash, check_number)
         logger.info(
             "Payment verified for user %s — stored. "
             "check_number=%s, has_text_hash=%s",
@@ -767,7 +837,7 @@ def main():
 
     logger.info("Bot started. Target channel: @%s", TARGET_CHANNEL)
     logger.info("Card: %s, Amount: %s BYN", CARD_NUMBER, PAYMENT_AMOUNT)
-    logger.info("Duplicate detection: file_hash + pHash + file_unique_id + text_hash + check_number")
+    logger.info("Duplicate detection: in-memory cache + file_hash + pHash + file_unique_id + text_hash + check_number")
     logger.info("Supabase: %s", SUPABASE_URL or "NOT CONFIGURED")
 
     application.run_polling()
