@@ -1,0 +1,6 @@
+python-telegram-bot[job-queue]~=22.8
+easyocr~=1.7.2
+opencv-python-headless~=4.10.0
+python-dotenv~=1.0.1
+torch>=2.0.0
+supabase>=2.11.0
